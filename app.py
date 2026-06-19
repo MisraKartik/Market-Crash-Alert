@@ -290,19 +290,27 @@ def fetch_raw_data(today_str: str) -> pd.DataFrame:
     end_date = (pd.Timestamp(today_str) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
     data = yf.download("^NSEI", start_date, end_date, progress=False)
-    vix = yf.download("^INDIAVIX", start_date, end_date, progress=False)
-    gold = yf.download("GC=F", start_date, end_date, progress=False)
-    crude = yf.download("CL=F", start_date, end_date, progress=False)
-    usdinr = yf.download("INR=X", start_date, end_date, progress=False)
 
-    for df in (data, vix, gold, crude, usdinr):
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel("Ticker")
+    # Fetch each auxiliary ticker individually — if one fails, keep going
+    aux = {}
+    for ticker, col in [("^INDIAVIX", "Vix"), ("GC=F", "Gold"),
+                        ("CL=F", "Crude"), ("INR=X", "Usdinr")]:
+        try:
+            df = yf.download(ticker, start_date, end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel("Ticker")
+            if not df.empty and "Close" in df.columns:
+                aux[col] = df["Close"]
+            else:
+                aux[col] = pd.Series(dtype="float64")
+        except Exception:
+            aux[col] = pd.Series(dtype="float64")
 
-    data["Vix"] = vix["Close"]
-    data["Gold"] = gold["Close"]
-    data["Crude"] = crude["Close"]
-    data["Usdinr"] = usdinr["Close"]
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.droplevel("Ticker")
+
+    for col, series in aux.items():
+        data[col] = series
 
     if "Volume" in data.columns:
         data = data.drop(columns=["Volume"])
@@ -361,7 +369,10 @@ def create_features(df: pd.DataFrame, threshold_pct: int) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource(ttl=86400, show_spinner=False)
 def train_models(threshold_pct: int, today_str: str, _raw_data: pd.DataFrame):
-    """Train + Platt-calibrate all 4 models for one crash threshold."""
+    """Train + Platt-calibrate all 4 models for one crash threshold.
+
+    Returns (models_dict | None, pred_data, fallback_prob | None, diag_dict).
+    """
     data_features = create_features(_raw_data, threshold_pct)
     train_data = data_features.iloc[252:-21, :]
     pred_data = data_features.iloc[-21:, :-1]
@@ -369,8 +380,30 @@ def train_models(threshold_pct: int, today_str: str, _raw_data: pd.DataFrame):
     X = train_data.drop(columns=["crash"])
     y = train_data["crash"]
 
+    # Drop rows where any feature is NaN (e.g. missing VIX from cloud)
+    mask = X.notna().all(axis=1)
+    X = X.loc[mask]
+    y = y.loc[mask]
+
+    diag = {
+        "raw_rows": len(_raw_data),
+        "feature_rows": len(data_features),
+        "train_rows_after_na_drop": len(X),
+        "positive_samples": int(y.sum()),
+        "negative_samples": int((y == 0).sum()),
+        "unique_classes": int(y.nunique()),
+    }
+
+    # ── Layer 1: full target is single-class ────────────────────────────
+    if y.nunique() < 2:
+        return None, pred_data, y.mean() * 100, diag
+
     params = BEST_PARAMS[threshold_pct]
-    cv = TimeSeriesSplit(n_splits=5, gap=21)
+
+    # ── Layer 2: adapt CV splits to positive-class count ────────────────
+    n_pos = int(y.sum())
+    n_splits = min(5, max(2, n_pos))
+    cv = TimeSeriesSplit(n_splits=n_splits, gap=21)
 
     estimators = {
         "CatBoost": CatBoostClassifier(**params["CatBoost"]),
@@ -379,24 +412,48 @@ def train_models(threshold_pct: int, today_str: str, _raw_data: pd.DataFrame):
         "Random Forest": RandomForestClassifier(**params["Random Forest"]),
     }
 
+    # ── Layer 3: per-model try/except ───────────────────────────────────
     models = {}
+    failed = {}
     for name in MODEL_ORDER:
-        calibrated = CalibratedClassifierCV(estimator=estimators[name], method="sigmoid", cv=cv)
-        calibrated.fit(X, y)
-        models[name] = calibrated
+        try:
+            calibrated = CalibratedClassifierCV(
+                estimator=estimators[name], method="sigmoid", cv=cv,
+            )
+            calibrated.fit(X, y)
+            models[name] = calibrated
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "one unique value" in err_msg or "only one class" in err_msg:
+                failed[name] = "single-class in CV fold"
+            else:
+                failed[name] = str(e)[:120]
 
-    return models, pred_data
+    # ── Layer 4: if ALL models failed ───────────────────────────────────
+    if not models:
+        return None, pred_data, y.mean() * 100, diag
+
+    diag["models_trained"] = list(models.keys())
+    diag["models_failed"] = failed
+    return models, pred_data, None, diag
 
 
 def predict_probabilities(models: dict, pred_data: pd.DataFrame) -> pd.DataFrame:
-    """Per-model + blended crash probability for the last 21 trading days, EMA-smoothed."""
+    """Per-model + blended crash probability for the last 21 trading days."""
     out = {"date": pred_data.index}
     for name in MODEL_ORDER:
-        raw = models[name].predict_proba(pred_data)[:, 1] * 100
-        out[name] = pd.Series(raw).ewm(span=5).mean().values
+        if name in models:
+            raw = models[name].predict_proba(pred_data)[:, 1] * 100
+            out[name] = pd.Series(raw).ewm(span=5).mean().values
+        else:
+            out[name] = np.nan
 
     comparison = pd.DataFrame(out)
-    comparison["Blended"] = comparison[MODEL_ORDER].mean(axis=1)
+    available = [n for n in MODEL_ORDER if n in models]
+    if available:
+        comparison["Blended"] = comparison[available].mean(axis=1)
+    else:
+        comparison["Blended"] = np.nan
     return comparison
 
 
@@ -480,7 +537,7 @@ def nifty_price_chart(raw_data: pd.DataFrame, days: int = 90) -> go.Figure:
         hovermode="x",
         hoverlabel=dict(
             bgcolor="#1E293B",
-            bordercolor="rgba(255,255,255,0.08)",  # <-- Fixed (one word)
+            bordercolor="rgba(255,255,255,0.08)",
             font=dict(color="#E2E8F0", size=11),
         ),
     )
@@ -492,12 +549,13 @@ def trend_figure(comparison: pd.DataFrame, show_models: bool) -> go.Figure:
     fig = go.Figure()
     if show_models:
         for name in MODEL_ORDER:
-            fig.add_trace(go.Scatter(
-                x=comparison["date"], y=comparison[name],
-                mode="lines+markers", name=name,
-                line=dict(color=MODEL_COLORS[name], width=1.5),
-                marker=dict(size=3, color=MODEL_COLORS[name]),
-            ))
+            if name in comparison.columns and comparison[name].notna().any():
+                fig.add_trace(go.Scatter(
+                    x=comparison["date"], y=comparison[name],
+                    mode="lines+markers", name=name,
+                    line=dict(color=MODEL_COLORS[name], width=1.5),
+                    marker=dict(size=3, color=MODEL_COLORS[name]),
+                ))
     fig.add_trace(go.Scatter(
         x=comparison["date"], y=comparison["Blended"],
         mode="lines+markers", name="Blended",
@@ -528,7 +586,7 @@ def trend_figure(comparison: pd.DataFrame, show_models: bool) -> go.Figure:
         hovermode="x unified",
         hoverlabel=dict(
             bgcolor="#1E293B",
-            bordercolor="rgba(255,255,255,0.08)",  # <-- Fixed (one word)
+            bordercolor="rgba(255,255,255,0.08)",
             font=dict(color="#E2E8F0", size=11),
         ),
         margin=dict(l=10, r=10, t=45, b=10),
@@ -546,8 +604,47 @@ def _delta_str(current: float, previous: float) -> str:
 
 def render_threshold_tab(threshold_pct: int, raw_data: pd.DataFrame, today_str: str):
     with st.spinner(f"Training models for the {threshold_pct}% threshold…"):
-        models, pred_data = train_models(threshold_pct, today_str, raw_data)
-        comparison = predict_probabilities(models, pred_data)
+        models, pred_data, fallback_prob, diag = train_models(
+            threshold_pct, today_str, raw_data,
+        )
+
+    # ── Debug expander (always visible, collapsed) ──────────────────────
+    with st.expander("🔍 Data diagnostics", expanded=False):
+        d1, d2 = st.columns(2)
+        d1.markdown(f"**Raw data rows:** {diag['raw_rows']}")
+        d1.markdown(f"**After feature engineering:** {diag['feature_rows']}")
+        d2.markdown(f"**Train rows (after NaN drop):** {diag['train_rows_after_na_drop']}")
+        d2.markdown(f"**Positive samples:** {diag['positive_samples']}  ·  "
+                     f"**Negative:** {diag['negative_samples']}  ·  "
+                     f"**Classes:** {diag['unique_classes']}")
+        if "models_failed" in diag and diag["models_failed"]:
+            st.markdown("**Failed models:**")
+            for m, reason in diag["models_failed"].items():
+                st.markdown(f"- {m}: *{reason}*")
+
+    # ── Fallback path ───────────────────────────────────────────────────
+    if models is None:
+        st.warning(
+            f"⚠️ **Cannot train models for >{threshold_pct}% threshold** — "
+            f"the training data contains only **{diag['unique_classes']} class(es)** "
+            f"({diag['positive_samples']} crash events out of "
+            f"{diag['train_rows_after_na_drop']} rows).\n\n"
+            f"This typically happens when Yahoo Finance returns incomplete auxiliary "
+            f"data (especially **^INDIAVIX**) from cloud servers, shrinking the "
+            f"usable training window.\n\n"
+            f"Showing the historical crash frequency (**{fallback_prob:.2f}%**) "
+            f"as a baseline estimate."
+        )
+        st.markdown(
+            f'<div style="max-width:480px;margin:0 auto;">'
+            f'{probability_card_html(fallback_prob, threshold_pct)}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Normal path ─────────────────────────────────────────────────────
+    comparison = predict_probabilities(models, pred_data)
 
     latest = comparison.iloc[-1]
     latest_date = pd.Timestamp(latest["date"]).strftime("%Y-%m-%d")
@@ -561,20 +658,26 @@ def render_threshold_tab(threshold_pct: int, raw_data: pd.DataFrame, today_str: 
     if show_models:
         col_card, col_chart = st.columns([5, 7])
         with col_card:
-            st.markdown(probability_card_html(latest["Blended"], threshold_pct), unsafe_allow_html=True)
+            st.markdown(
+                probability_card_html(latest["Blended"], threshold_pct),
+                unsafe_allow_html=True,
+            )
         with col_chart:
             st.plotly_chart(trend_figure(comparison, True), use_container_width=True)
 
-        st.markdown("**Per-model probability (today, EMA-smoothed):**")
-        cols = st.columns(len(MODEL_ORDER))
-        for c, name in zip(cols, MODEL_ORDER):
-            c.metric(name, f"{latest[name]:.2f}%")
+        successful = [n for n in MODEL_ORDER if n in models]
+        if successful:
+            st.markdown("**Per-model probability (today, EMA-smoothed):**")
+            cols = st.columns(len(successful))
+            for c, name in zip(cols, successful):
+                c.metric(name, f"{latest[name]:.2f}%")
 
         with st.expander("Full table — last 21 trading days"):
             display_df = comparison.copy()
             display_df["date"] = pd.to_datetime(display_df["date"]).dt.strftime("%Y-%m-%d")
+            fmt_cols = {c: "{:.2f}" for c in MODEL_ORDER + ["Blended"]}
             st.dataframe(
-                display_df.style.format({c: "{:.2f}" for c in MODEL_ORDER + ["Blended"]}),
+                display_df.style.format(fmt_cols),
                 use_container_width=True, height=420,
             )
     else:
