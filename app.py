@@ -361,16 +361,41 @@ def create_features(df: pd.DataFrame, threshold_pct: int) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource(ttl=86400, show_spinner=False)
 def train_models(threshold_pct: int, today_str: str, _raw_data: pd.DataFrame):
-    """Train + Platt-calibrate all 4 models for one crash threshold."""
+    """Train + Platt-calibrate all 4 models for one crash threshold with safe CV handling."""
     data_features = create_features(_raw_data, threshold_pct)
-    train_data = data_features.iloc[252:-21, :]
+    
+    # Drop rows where target or critical features are NaN due to rolling windows
+    train_data = data_features.iloc[252:-21, :].dropna(subset=["crash"])
     pred_data = data_features.iloc[-21:, :-1]
 
     X = train_data.drop(columns=["crash"])
     y = train_data["crash"]
 
+    # Global check: If the entire dataset lacks representation, handle it safely
+    if len(np.unique(y)) < 2:
+        st.error(f"Not enough crash events found in history for a >{threshold_pct}% threshold to train models.")
+        st.stop()
+
     params = BEST_PARAMS[threshold_pct]
-    cv = TimeSeriesSplit(n_splits=5, gap=21)
+    
+    # Dynamic CV splits: If data is small or severely imbalanced, reduce splits
+    # to avoid empty target folds in early TimeSeriesSplit chunks.
+    num_splits = 5
+    while num_splits >= 2:
+        try:
+            cv = TimeSeriesSplit(n_splits=num_splits, gap=21)
+            # Test if any fold violates the 2-class requirement
+            for train_idx, _ in cv.split(X):
+                if len(np.unique(y.iloc[train_idx])) < 2:
+                    raise ValueError("A CV fold contains only one class.")
+            break # Splits are valid
+        except ValueError:
+            num_splits -= 1
+            
+    # If TimeSeriesSplit fails completely, fall back to a standard Stratified K-Fold
+    if num_splits < 2:
+        from sklearn.model_selection import StratifiedKFold
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
     estimators = {
         "CatBoost": CatBoostClassifier(**params["CatBoost"]),
@@ -381,6 +406,7 @@ def train_models(threshold_pct: int, today_str: str, _raw_data: pd.DataFrame):
 
     models = {}
     for name in MODEL_ORDER:
+        # Pass our safely verified 'cv' strategy here
         calibrated = CalibratedClassifierCV(estimator=estimators[name], method="sigmoid", cv=cv)
         calibrated.fit(X, y)
         models[name] = calibrated
