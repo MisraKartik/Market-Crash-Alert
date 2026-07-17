@@ -11,6 +11,9 @@ and are hardcoded below — this app does NOT re-run Optuna, it only retrains
 the final models on the latest data using those tuned settings.
 """
 
+import time
+import random
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -232,7 +235,8 @@ BEST_PARAMS = {
     5: {
         "CatBoost": {'iterations': 571, 'depth': 4, 'learning_rate': 0.05661931766180711,
                      'l2_leaf_reg': 0.29404685513045253, 'bagging_temperature': 9.513300124803049,
-                     'border_count': 109, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
+                     'border_count': 109, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,
+                     'allow_writing_files': False},
         "LightGBM": {'n_estimators': 573, 'max_depth': 4, 'learning_rate': 0.11460173504474114,
                      'reg_lambda': 7.1373179990944635, 'bagging_fraction': 0.7753961167775515,
                      'bagging_freq': 7, 'num_leaves': 181, 'is_unbalance': True, 'random_seed': 42,
@@ -248,7 +252,8 @@ BEST_PARAMS = {
     8: {
         "CatBoost": {'iterations': 915, 'depth': 4, 'learning_rate': 0.011087474024424357,
                      'l2_leaf_reg': 0.19500328134451508, 'bagging_temperature': 7.082518856813896,
-                     'border_count': 80, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
+                     'border_count': 80, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,
+                     'allow_writing_files': False},
         "LightGBM": {'n_estimators': 922, 'max_depth': 4, 'learning_rate': 0.2006367115709413,
                      'reg_lambda': 1.6587762315219337, 'bagging_fraction': 0.7115397396796371,
                      'bagging_freq': 6, 'num_leaves': 179, 'is_unbalance': True, 'random_seed': 42,
@@ -264,7 +269,8 @@ BEST_PARAMS = {
     10: {
         "CatBoost": {'iterations': 517, 'depth': 5, 'learning_rate': 0.03144680401056169,
                      'l2_leaf_reg': 1.086518779621556, 'bagging_temperature': 0.9428351018151659,
-                     'border_count': 68, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
+                     'border_count': 68, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,
+                     'allow_writing_files': False},
         "LightGBM": {'n_estimators': 519, 'max_depth': 10, 'learning_rate': 0.23791135901632696,
                      'reg_lambda': 4.1959659512522265, 'bagging_fraction': 0.9732734868735332,
                      'bagging_freq': 4, 'num_leaves': 235, 'is_unbalance': True, 'random_seed': 42,
@@ -283,17 +289,44 @@ BEST_PARAMS = {
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA
 # ═══════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner=False)
+def _download_with_retry(ticker: str, start_date: str, end_date: str,
+                          max_retries: int = 5, base_delay: float = 3.0) -> pd.DataFrame:
+    """yf.download wrapped with exponential backoff + jitter.
+
+    Streamlit Community Cloud shares outbound IPs across many apps, so
+    Yahoo Finance rate-limits (YFRateLimitError / 'Too Many Requests') are
+    common there even though they rarely happen locally. Retrying with
+    backoff resolves most of these transparently.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            if df is not None and not df.empty:
+                return df
+            last_err = RuntimeError(f"Empty response for {ticker}")
+        except Exception as e:  # yfinance raises YFRateLimitError, JSONDecodeError, etc.
+            last_err = e
+
+        if attempt < max_retries - 1:
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1.5)
+            time.sleep(delay)
+
+    raise RuntimeError(f"Failed to download '{ticker}' from Yahoo Finance after "
+                        f"{max_retries} attempts: {last_err}")
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
 def fetch_raw_data(today_str: str) -> pd.DataFrame:
     """Pull Nifty 50 + macro series from Yahoo Finance, up to today."""
     start_date = "2010-01-01"
     end_date = (pd.Timestamp(today_str) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    data = yf.download("^NSEI", start_date, end_date, progress=False)
-    vix = yf.download("^INDIAVIX", start_date, end_date, progress=False)
-    gold = yf.download("GC=F", start_date, end_date, progress=False)
-    crude = yf.download("CL=F", start_date, end_date, progress=False)
-    usdinr = yf.download("INR=X", start_date, end_date, progress=False)
+    data = _download_with_retry("^NSEI", start_date, end_date)
+    vix = _download_with_retry("^INDIAVIX", start_date, end_date)
+    gold = _download_with_retry("GC=F", start_date, end_date)
+    crude = _download_with_retry("CL=F", start_date, end_date)
+    usdinr = _download_with_retry("INR=X", start_date, end_date)
 
     for df in (data, vix, gold, crude, usdinr):
         if isinstance(df.columns, pd.MultiIndex):
@@ -308,6 +341,20 @@ def fetch_raw_data(today_str: str) -> pd.DataFrame:
         data = data.drop(columns=["Volume"])
 
     data = data.sort_index()
+
+    # Guard against silently training on broken/empty data (e.g. a rate
+    # limit that slipped through, or Yahoo returning a mostly-NaN frame).
+    # This turns a confusing downstream CatBoostError ("Target contains
+    # only one unique value") into a clear, actionable message.
+    min_required_rows = 400  # comfortably more than the 252+21 the model needs
+    if len(data) < min_required_rows or data["Close"].isna().mean() > 0.2:
+        raise RuntimeError(
+            f"Downloaded market data looks incomplete ({len(data)} rows, "
+            f"{data['Close'].isna().mean():.0%} missing closes). This usually "
+            "means Yahoo Finance rate-limited the request. Try refreshing "
+            "in a minute."
+        )
+
     return data
 
 
@@ -615,7 +662,15 @@ def main():
 
     # ── Data ─────────────────────────────────────────────────────────────
     with st.spinner("Fetching market data…"):
-        raw_data = fetch_raw_data(today_str)
+        try:
+            raw_data = fetch_raw_data(today_str)
+        except Exception as e:
+            st.error(
+                "⚠️ Couldn't fetch market data from Yahoo Finance right now "
+                "(likely a temporary rate limit). Please refresh in a minute."
+            )
+            st.caption(f"Details: {e}")
+            return
     if raw_data.empty:
         st.error("Could not fetch market data. Please try again shortly.")
         return
