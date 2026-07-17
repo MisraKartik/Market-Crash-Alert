@@ -232,7 +232,7 @@ BEST_PARAMS = {
     5: {
         "CatBoost": {'iterations': 571, 'depth': 4, 'learning_rate': 0.05661931766180711,
                      'l2_leaf_reg': 0.29404685513045253, 'bagging_temperature': 9.513300124803049,
-                     'border_count': 109, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0},
+                     'border_count': 109, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
         "LightGBM": {'n_estimators': 573, 'max_depth': 4, 'learning_rate': 0.11460173504474114,
                      'reg_lambda': 7.1373179990944635, 'bagging_fraction': 0.7753961167775515,
                      'bagging_freq': 7, 'num_leaves': 181, 'is_unbalance': True, 'random_seed': 42,
@@ -248,7 +248,7 @@ BEST_PARAMS = {
     8: {
         "CatBoost": {'iterations': 915, 'depth': 4, 'learning_rate': 0.011087474024424357,
                      'l2_leaf_reg': 0.19500328134451508, 'bagging_temperature': 7.082518856813896,
-                     'border_count': 80, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0},
+                     'border_count': 80, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
         "LightGBM": {'n_estimators': 922, 'max_depth': 4, 'learning_rate': 0.2006367115709413,
                      'reg_lambda': 1.6587762315219337, 'bagging_fraction': 0.7115397396796371,
                      'bagging_freq': 6, 'num_leaves': 179, 'is_unbalance': True, 'random_seed': 42,
@@ -264,7 +264,7 @@ BEST_PARAMS = {
     10: {
         "CatBoost": {'iterations': 517, 'depth': 5, 'learning_rate': 0.03144680401056169,
                      'l2_leaf_reg': 1.086518779621556, 'bagging_temperature': 0.9428351018151659,
-                     'border_count': 68, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0},
+                     'border_count': 68, 'auto_class_weights': 'Balanced', 'random_seed': 42, 'verbose': 0,'allow_writing_files': False},
         "LightGBM": {'n_estimators': 519, 'max_depth': 10, 'learning_rate': 0.23791135901632696,
                      'reg_lambda': 4.1959659512522265, 'bagging_fraction': 0.9732734868735332,
                      'bagging_freq': 4, 'num_leaves': 235, 'is_unbalance': True, 'random_seed': 42,
